@@ -91,6 +91,16 @@ The proposed patches add:
 
 See [azure-vm-agents-plugin/README.md](azure-vm-agents-plugin/) for the full analysis and patch plan.
 
+### SSH Agents Plugin: Immediate Queue Maintenance on Agent State Changes
+
+The SSH agents plugin (`ssh-slaves`) is the `ComputerLauncher` implementation used to launch Jenkins agents over SSH. Unlike cloud plugins, it has **zero code paths under the Queue lock** — all heavy SSH work (connection, authentication, SFTP/SCP file transfer, remote process launch, disconnect cleanup) runs on `Computer.threadPoolForRemoting` or a per-launcher `ExecutorService`.
+
+The plugin's Queue performance gap is the absence of `scheduleMaintenance()` calls. When an SSH agent comes online or goes offline, the Queue should re-evaluate immediately. Now that Queue maintenance completes in milliseconds, triggering it on every capacity-changing event is essentially free.
+
+The patch adds a `ComputerListener` that calls `scheduleMaintenance()` on four SSH agent lifecycle events: `onOnline` (agent ready — fires after all listeners complete, making it a more reliable signal than core's `_setChannel()` call alone), `onOffline` (capacity lost — triggers replacement provisioning), `onTemporarilyOnline` (capacity restored), and `onTemporarilyOffline` (capacity temporarily unavailable).
+
+See [ssh-agents-plugin/README.md](ssh-agents-plugin/) for the full audit and patch details.
+
 ---
 
 ## Results
@@ -111,6 +121,7 @@ Each plugin subfolder has a README summarizing the actual Java patches (diffed a
 
 - **[ec2-plugin/](ec2-plugin/)** — 8 files, +470/-185 lines. Async retention, async provisioning, instance count cache, batch describeInstances, queue maintenance triggers.
 - **[azure-vm-agents-plugin/](azure-vm-agents-plugin/)** — ~10 files proposed. Comprehensive scheduleMaintenance() triggers (10 events), async template verification, optimistic node reuse, VM existence cache.
+- **[ssh-agents-plugin/](ssh-agents-plugin/)** — 1 new file, ~40 lines. ComputerListener for scheduleMaintenance() triggers on SSH agent online/offline/temporarily-online/temporarily-offline events. All existing code paths already run outside Queue lock — no changes needed.
 - **[leastload-plugin/](leastload-plugin/)** — 1 file, +203/-38 lines. Pipeline support, per-label round-robin, single-node immediate assign, load prediction skip.
 - **[job-restrictions-plugin/](job-restrictions-plugin/)** — 7 files, +141/-47 lines. canTake TTL cache, transient volatile fix for XStream deserialization.
 - **[jenkins/](jenkins/)** — Jenkins core Queue analysis (no code changes). Queue lock contention, MappingWorksheet performance, queue time breakdown pie chart.
