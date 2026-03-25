@@ -1,6 +1,6 @@
 # Ludicrous Mode: Jenkins Queue Performance
 
-A coordinated patch set across three Jenkins plugins that transforms Queue maintenance from a 30+ second blocking operation into a millisecond-fast non-blocking pipeline.
+A coordinated patch set across Jenkins plugins that transforms Queue maintenance from a 30+ second blocking operation into a millisecond-fast non-blocking pipeline.
 
 ---
 
@@ -75,6 +75,22 @@ Critically, the cache's `ConcurrentHashMap` is declared `transient volatile` wit
 
 See [job-restrictions-plugin/README.md](job-restrictions-plugin/) for the full patch breakdown.
 
+### Azure VM Agents Plugin: scheduleMaintenance() Triggers and Async Provisioning
+
+The Azure VM agents plugin provisions Jenkins agents on Azure VMs. Unlike the EC2 plugin, its retention strategies already defer Azure API calls to background thread pools — the Queue lock path is lightweight. However, the plugin never calls `scheduleMaintenance()`, meaning the Queue waits up to 5 seconds before noticing new or removed agents. Additionally, `Cloud.provision()` makes synchronous Azure API calls on the NodeProvisioner thread: template verification lists all VMs in the resource group, and node reuse checks call `getByResourceGroup()` per offline Azure VM.
+
+The proposed patches add:
+
+1. **Comprehensive scheduleMaintenance() triggers** at 10 capacity-change events: agent online, VM reuse complete, new VM provisioned, SSH reconnect, deployment submitted, pool provisioning, agent deprovisioned, agent shutdown, dead node cleaned, excess VMs deleted. Immediate triggers (0ms) for "agent ready" events, delayed triggers (~1s) for "capacity planned/removed" events.
+
+2. **Async template verification** — `provision()` submits verification to a background thread instead of blocking the provisioner. The next NodeProvisioner cycle finds the template verified.
+
+3. **Optimistic node reuse** — `virtualMachineExists()` moves inside the PlannedNode future, eliminating N sequential Azure API calls from the provisioner thread.
+
+4. **VM existence caching** — Caffeine TTL cache (30s default) for `virtualMachineExists()` results, cutting redundant API calls during cleanup and reuse.
+
+See [azure-vm-agents-plugin/README.md](azure-vm-agents-plugin/) for the full analysis and patch plan.
+
 ---
 
 ## Results
@@ -94,6 +110,7 @@ With all three patches applied:
 Each plugin subfolder has a README summarizing the actual Java patches (diffed against `origin/master`) with references to background analysis:
 
 - **[ec2-plugin/](ec2-plugin/)** — 8 files, +470/-185 lines. Async retention, async provisioning, instance count cache, batch describeInstances, queue maintenance triggers.
+- **[azure-vm-agents-plugin/](azure-vm-agents-plugin/)** — ~10 files proposed. Comprehensive scheduleMaintenance() triggers (10 events), async template verification, optimistic node reuse, VM existence cache.
 - **[leastload-plugin/](leastload-plugin/)** — 1 file, +203/-38 lines. Pipeline support, per-label round-robin, single-node immediate assign, load prediction skip.
 - **[job-restrictions-plugin/](job-restrictions-plugin/)** — 7 files, +141/-47 lines. canTake TTL cache, transient volatile fix for XStream deserialization.
 - **[jenkins/](jenkins/)** — Jenkins core Queue analysis (no code changes). Queue lock contention, MappingWorksheet performance, queue time breakdown pie chart.
@@ -110,6 +127,8 @@ All optimizations are configurable via system properties:
 | `jenkins.ec2.instanceCountCacheTtlMs` | 30000 | ec2 | Instance count cache TTL |
 | `jenkins.ec2.scheduleMaintenanceDelayMs` | 1000 | ec2 | Delay before queue maintenance on early provisioning events |
 | `hudson.plugins.ec2.EC2Computer.instanceCacheTTLMs` | 30000 | ec2 | SSH verification state cache TTL |
+| `azure.vm.scheduleMaintenanceDelayMs` | 1000 | azure-vm-agents | Delay before queue maintenance on non-immediate events |
+| `azure.vm.existsCacheTtlMs` | 30000 | azure-vm-agents | VM existence cache TTL |
 | `JobRestrictionProperty.cacheDisabled` | false | job-restrictions | Disable canTake cache |
 | `JobRestrictionProperty.cacheTtlMs` | 30000 | job-restrictions | canTake cache TTL |
 | `JobRestrictionProperty.cacheMaxEntries` | 500 | job-restrictions | Max cache entries per node |
