@@ -105,6 +105,20 @@ Three issues were found:
 
 See [lockable-resources-plugin/README.md](lockable-resources-plugin/) for the full analysis and patch plan.
 
+### Kubernetes Plugin: scheduleMaintenance() Triggers for Immediate Queue Response
+
+The kubernetes-plugin provisions Jenkins agents as Kubernetes pods. Its architecture is fundamentally well-suited for Queue performance — unlike EC2 and Azure plugins, `KubernetesCloud.provision()` makes **no Kubernetes API calls** and returns already-completed `PlannedNode` futures. All heavyweight operations (pod creation, waiting for readiness, pod deletion) run on `Computer.threadPoolForRemoting`. The `QueueTaskDispatcher` (`canTake()`) does only in-memory folder permission checks. Retention strategies delegate to core/durable-task (`OnceRetentionStrategy`, `CloudRetentionStrategy`), both lightweight.
+
+The only gap is the absence of `scheduleMaintenance()` triggers. When agents come online, pods are deleted or fail, or garbage collection removes orphan pods, the Queue is not notified — it waits up to 5 seconds for the next periodic `maintain()` cycle.
+
+The proposed patch adds:
+
+1. **A new `KubernetesComputerListener`** — calls `scheduleMaintenance()` on `onOnline`, `onOffline`, `onTemporarilyOnline`, and `onTemporarilyOffline` for Kubernetes agents.
+2. **`scheduleMaintenance()` in Reaper event handlers** — `RemoveAgentOnPodDeleted`, `TerminateAgentOnContainerTerminated`, `TerminateAgentOnPodFailed`, and `TerminateAgentOnImagePullBackOff` all trigger immediate Queue re-evaluation after agent removal/termination.
+3. **`scheduleMaintenance()` in GarbageCollection** — after deleting orphan pods.
+
+See [kubernetes-plugin/README.md](kubernetes-plugin/) for the full analysis.
+
 ### SSH Agents Plugin: Immediate Queue Maintenance on Agent State Changes
 
 The SSH agents plugin (`ssh-slaves`) is the `ComputerLauncher` implementation used to launch Jenkins agents over SSH. Unlike cloud plugins, it has **zero code paths under the Queue lock** — all heavy SSH work (connection, authentication, SFTP/SCP file transfer, remote process launch, disconnect cleanup) runs on `Computer.threadPoolForRemoting` or a per-launcher `ExecutorService`.
@@ -134,6 +148,7 @@ With all three patches applied:
 Each plugin subfolder has a README summarizing the actual Java patches (diffed against `origin/master`) with references to background analysis:
 
 - **[ec2-plugin/](ec2-plugin/)** — 8 files, +470/-185 lines. Async retention, async provisioning, instance count cache, batch describeInstances, queue maintenance triggers.
+- **[kubernetes-plugin/](kubernetes-plugin/)** — ~2 files proposed. Already well-architected (no heavyweight code under Queue lock, no provisioner blocking). Adds scheduleMaintenance() triggers via new ComputerListener + Reaper event handlers + GarbageCollection. All Queue lock paths already lightweight.
 - **[azure-vm-agents-plugin/](azure-vm-agents-plugin/)** — ~10 files proposed. Comprehensive scheduleMaintenance() triggers (10 events), async template verification, optimistic node reuse, VM existence cache.
 - **[lockable-resources-plugin/](lockable-resources-plugin/)** — ~3–5 files proposed. scheduleMaintenance() triggers (6 events), async save to reduce syncResources contention, Groovy script result caching, label expression caching. QueueTaskDispatcher runs in innermost Queue lock loop.
 - **[ssh-agents-plugin/](ssh-agents-plugin/)** — 1 new file, ~40 lines. ComputerListener for scheduleMaintenance() triggers on SSH agent online/offline/temporarily-online/temporarily-offline events. All existing code paths already run outside Queue lock — no changes needed.
