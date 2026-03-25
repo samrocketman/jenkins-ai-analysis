@@ -91,6 +91,20 @@ The proposed patches add:
 
 See [azure-vm-agents-plugin/README.md](azure-vm-agents-plugin/) for the full analysis and patch plan.
 
+### Lockable Resources Plugin: scheduleMaintenance() Triggers, Contention Reduction, and Script Caching
+
+The lockable-resources-plugin hooks into the Queue via a `QueueTaskDispatcher` — its `canRun(Queue.Item)` method is called **under the Queue lock** for every item on every `Queue.maintain()` cycle. Unlike cloud plugins that use `RetentionStrategy` or `Cloud`, a `QueueTaskDispatcher` sits in the absolute innermost loop of Queue maintenance.
+
+Three issues were found:
+
+1. **No `scheduleMaintenance()` triggers anywhere.** When resources are freed (build completes, pipeline lock body finishes, user unreserves via UI), items waiting in the Jenkins Queue for those resources wait up to 5 seconds for the next timer tick. The proposed patch adds immediate `scheduleMaintenance()` calls at 6 resource-freeing events: `unlockResources()`, `unreserve()`, `reset()`, `LockRunListener.onCompleted()`, `LockRunListener.onDeleted()`, and `FreeDeadJobs.freePostMortemResources()`.
+
+2. **`syncResources` lock contention under Queue lock.** The plugin uses a `synchronized(syncResources)` monitor in `tryQueue()` that is also held by threads doing disk I/O (`save()`). When `onCompleted()` holds `syncResources` during a config write, `canRun()` under the Queue lock blocks waiting — transitively extending Queue lock hold time by disk write latency. The proposed fix makes `save()` asynchronous and narrows the `syncResources` scope.
+
+3. **Groovy script evaluation under Queue lock.** When jobs use `resourceMatchScript`, `canRun()` evaluates a Groovy script for every lockable resource on every cache miss. The existing `cachedCandidates` Guava cache mitigates repeated evaluations, but cache misses (first call, or after resource state change) are heavyweight. The proposed fix adds a per-resource script result TTL cache.
+
+See [lockable-resources-plugin/README.md](lockable-resources-plugin/) for the full analysis and patch plan.
+
 ### SSH Agents Plugin: Immediate Queue Maintenance on Agent State Changes
 
 The SSH agents plugin (`ssh-slaves`) is the `ComputerLauncher` implementation used to launch Jenkins agents over SSH. Unlike cloud plugins, it has **zero code paths under the Queue lock** — all heavy SSH work (connection, authentication, SFTP/SCP file transfer, remote process launch, disconnect cleanup) runs on `Computer.threadPoolForRemoting` or a per-launcher `ExecutorService`.
@@ -121,6 +135,7 @@ Each plugin subfolder has a README summarizing the actual Java patches (diffed a
 
 - **[ec2-plugin/](ec2-plugin/)** — 8 files, +470/-185 lines. Async retention, async provisioning, instance count cache, batch describeInstances, queue maintenance triggers.
 - **[azure-vm-agents-plugin/](azure-vm-agents-plugin/)** — ~10 files proposed. Comprehensive scheduleMaintenance() triggers (10 events), async template verification, optimistic node reuse, VM existence cache.
+- **[lockable-resources-plugin/](lockable-resources-plugin/)** — ~3–5 files proposed. scheduleMaintenance() triggers (6 events), async save to reduce syncResources contention, Groovy script result caching, label expression caching. QueueTaskDispatcher runs in innermost Queue lock loop.
 - **[ssh-agents-plugin/](ssh-agents-plugin/)** — 1 new file, ~40 lines. ComputerListener for scheduleMaintenance() triggers on SSH agent online/offline/temporarily-online/temporarily-offline events. All existing code paths already run outside Queue lock — no changes needed.
 - **[leastload-plugin/](leastload-plugin/)** — 1 file, +203/-38 lines. Pipeline support, per-label round-robin, single-node immediate assign, load prediction skip.
 - **[job-restrictions-plugin/](job-restrictions-plugin/)** — 7 files, +141/-47 lines. canTake TTL cache, transient volatile fix for XStream deserialization.
@@ -143,4 +158,7 @@ All optimizations are configurable via system properties:
 | `JobRestrictionProperty.cacheDisabled` | false | job-restrictions | Disable canTake cache |
 | `JobRestrictionProperty.cacheTtlMs` | 30000 | job-restrictions | canTake cache TTL |
 | `JobRestrictionProperty.cacheMaxEntries` | 500 | job-restrictions | Max cache entries per node |
+| `lockable-resources.scriptCacheTtlMs` | 30000 | lockable-resources | Groovy script evaluation cache TTL |
+| `lockable-resources.asyncSave` | true | lockable-resources | Enable async disk persistence |
+| `lockable-resources.saveCoalesceMs` | 1000 | lockable-resources | Coalesce window for async saves (ms) |
 | `hudson.model.Queue.maintainInterval` | 5000 | jenkins core | Queue maintenance interval (ms) |
