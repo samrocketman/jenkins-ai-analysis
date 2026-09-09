@@ -63,6 +63,31 @@ one, and its id only becomes an instance id once fulfilled. Such a record expire
 cap then relies on `describeSpotInstanceRequests` reporting the request, which it normally does
 within seconds.
 
+## Re-verified after the adaptive hot spare work
+
+Both fixes still hold, and the guards were checked by breaking each fix and watching the tests
+report it rather than by only watching them pass.
+
+`EC2CloudConcurrentProvisionTest`, `EC2CloudInstanceCapTest`, `EC2CloudLabelRotationTest` and
+`EC2CloudProvisionFailoverTest` are green (23 tests). With `countInFlight` stubbed to zero, the
+template-cap case fails with two instances against a cap of one; with `provisionFromGroup` cut back
+to the template it was planned on, all four failover tests fail and three of the rotation fallback
+cases fail with nothing launched at all.
+
+Two things are worth knowing about the guards:
+
+- the cloud-wide concurrent case is the weaker of the two 2030 tests. Overshooting it needs the
+  requests to interleave in a particular way, and it passed on one run with the fix removed while
+  the template-cap case failed on both runs. The template-cap case is the one to trust.
+- the rotation test for a template sitting at its instance cap keeps passing without
+  `provisionFromGroup`, because that fallback happens in the synchronous cap check in `provision`
+  before the async task starts. It guards a different path, not this one.
+
+The hot spare path added since is not a way around the caps: `MinimumInstanceChecker` provisions
+through `EC2Cloud.provision(SlaveTemplate, int)`, so it reaches the same cap check and the same
+in-flight record under `slaveCountingLock`. The new queue and executor triggers only make that path
+run more often, which is what the concurrent test already exercises.
+
 ## Queue maintenance latency
 
 `Queue.maintain()` runs under the Queue lock, so none of the above may reach an EC2 call from it.
