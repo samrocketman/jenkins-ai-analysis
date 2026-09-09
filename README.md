@@ -10,3 +10,4 @@ For Jenkins to compete, it needs an overhaul in how it views speed to verify eve
 My current analysis initiatives:
 
 - [Ludicrous mode patch series](ludicrous-mode-analysis) which aims to solve Queueing delays when Jenkins needs to schedule work on agents.
+- [EC2 autoscaling hot spares by agent label](ec2-autoscaling-hot-spares)
