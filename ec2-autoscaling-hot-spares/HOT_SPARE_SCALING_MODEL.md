@@ -33,8 +33,8 @@ a minute for the next periodic pass.
 | The label is in use at all | an executor taken, or anything queued or running | target is at least one step |
 | Work in sight above that | `queued + busy` | target follows it immediately |
 | Spares taken the instant they appear, or a queue nothing in flight can serve | `consumed > 0 && spares == 0`, or `queued > spares + provisioning` | target raised to one step above the load, at most once a minute |
-| Nothing running, queued, or starting | quiet for one idle timeout | target gives up one step |
-| A spare reclaimed for being idle | `EC2RetentionStrategy` idle timeout | target gives up one step |
+| In use, but with less work than the target holds | `queued + busy < target` for a whole idle timeout | target gives up one step, no lower than the load |
+| Nothing running, queued, or starting | quiet for one idle timeout | target gives up one step, no lower than the base |
 
 Bounds: `baseHotSpares` is the floor, `maxHotSpares` the ceiling, and the cover cannot take the
 target beyond `queued + busy + step`. That last bound is what stops a label whose templates are all
@@ -79,9 +79,60 @@ minute (`jenkins.ec2.hotSpareGrowthIntervalMs`), so a burst cannot add several s
 the first instances have booted. Following the load needs no rate limit, being idempotent: the same
 load seen ten times in a minute asks for the same number.
 
-Decay on reclaimed spares matters as much as the timer: the step is the same size as the growth
-step, so it outruns agents timing out one at a time and the label does not re-provision the agents
-it is in the middle of giving up.
+## The target owns retention, not the idle timeout
+
+An earlier version let the idle timeout reclaim any spare that sat unused for its timeout, and
+lowered the target a step each time one was reclaimed. That produced exactly the churn the feature
+exists to avoid: a label holding the five spares its target asked for would time one out, the next
+pass would see a shortfall of one and launch a replacement, and a build arriving in between waited
+for a boot that had just been thrown away. With a base count above zero it never even settled — the
+target could not fall below the base, so the pool recycled itself forever.
+
+So the target decides how many spares a label keeps, and an agent is reclaimed only once the target
+has come down past it:
+
+- `MinimumInstanceChecker.isSpareStillWanted` ranks the label's spares by how long each has been
+  idle and keeps the freshest `target` of them. Ranking rather than comparing counts is what makes
+  several agents checking at once agree on which are the extras: each one asks where it sits in the
+  same order, so exactly `spares - target` are released instead of all of them deciding they are
+  surplus. The longest idle goes first, which is the behaviour an idle timeout implies.
+- `EC2RetentionStrategy` consults it on both idle paths, the plain timeout and the billing-period
+  one, and skips the termination while the label still wants the agent. The idle clock is not
+  reset, so the agent goes promptly once the target does fall past it.
+- Agents that cannot take work are not spares and are never protected by this: `isSpare` requires
+  idle, online, accepting tasks and not temporarily offline, so an agent that has drained its
+  maximum uses is reclaimed as before rather than satisfying the target while being useless. That
+  also fixes a counting bug of its own, since such an agent used to count towards the target and
+  suppress the provisioning of a real spare.
+
+## Template schedules
+
+`SlaveTemplate.minimumNumberOfInstancesTimeRangeConfig` - *Only apply minimum number of instances
+during specific time range* - was read by the per-template minimum-instances loop and by the
+retention strategy, but not by the label pass, so a rule warmed a template around the clock and
+undid the schedule. That is the workaround issue 2028 describes: a template per shift, offset so the
+spares are only paid for during working hours.
+
+The schedule stays a property of the template, which is what makes that arrangement work as one
+pool:
+
+- `provisionAcrossLabelGroup` skips a template outside its range and offers its share to the next
+  one, the same way it treats a template at its instance cap. A label with a template per shift
+  therefore warms up on whichever one is on duty.
+- `isSpare` returns false for an agent whose template is outside its range, so those agents neither
+  count towards the target nor are protected from the idle timeout. When a range closes, its agents
+  are released at their idle timeout while the open template warms up, and the pool migrates.
+- Nothing here gates the *load* signals. Builds queued for the label and agents running one are
+  measurements of demand and are counted whatever the schedule says; the schedule decides where
+  spares may be held, not whether the label is busy.
+
+A label whose every template is off duty simply holds no spares, and builds for it provision on
+their own account as they always did - the schedule is about warm capacity nobody asked for, not
+about refusing work.
+
+Making retention follow the target means the target has to come down on its own, which is what the
+in-use fade above is for. Without it a single burst would teach a label a peak, and the guard would
+hold that peak for as long as the label stayed busy at all.
 
 The target is not persisted. After a restart a label starts at its base count and re-learns within
 a few minutes, which is safer than restoring a number describing load that has since gone away.
@@ -96,8 +147,10 @@ a few minutes, which is safer than restoring a number describing load that has s
   after them rather than doubling up on the wave in hand.
 - Sustained load: every executor taken starts a replacement immediately, the target tracks the
   queued and running work, and a label that keeps emptying its pool gets one step of cover on top.
-- Load stops: spares sit idle, each reclamation drops the target a step, and the label returns to
-  its base count. With a base of 0 the label scales to nothing.
+- Load drops but does not stop: the pool is left alone for an idle timeout, then gives up a step at
+  a time down to the work still in sight. Nothing is recycled while the target still wants it.
+- Load stops: the target gives up a step per idle timeout down to the base count, and the spares
+  above it are reclaimed as it passes them. With a base of 0 the label scales to nothing.
 
 ## Coverage
 
@@ -106,8 +159,13 @@ a few minutes, which is safer than restoring a number describing load that has s
   step as its floor, one step of cover and no more when the pool keeps running dry, a single build
   bounded to its concurrency plus a step, holding while spares are taken with warm ones left, fading
   once the builds stop, settling once in-flight covers the queue, repeated checks not climbing, fade
-  to base, fade no further than base, reclaim, ceiling, zero step, agents that never time out,
+  to base, fade no further than base, the fade towards the load while the label stays busy, work
+  coming back mid-fade stopping it, ceiling, zero step, agents that never time out,
   billing-period timeouts, per-label isolation, cover bounded by work in sight.
+- `LabelHotSpareCheckerTest` also covers the schedules: no spares outside a template's time range,
+  the same rule provisioning inside it, and a label with a day and a night template keeping its
+  spares on the one that is on duty. `EC2RetentionStrategyTest` covers the other half, an idle spare
+  released once its template's range closes.
 - `LabelHotSpareCheckerTest`: queueing a build provisions spares with nothing but `Queue.maintain()`
   (no sweep, no manual pass), taking an executor starts the next spare the same way, a 20-wide
   parallel build warming 20 spares through the real queue, spares replaced as they are consumed (the
@@ -115,7 +173,8 @@ a few minutes, which is safer than restoring a number describing load that has s
   in the queue so a branch being picked up cannot move the counts mid-assertion, and Jenkins' own
   `NodeProvisioner.Strategy` extensions are removed so every agent counted is one the hot spare pass
   launched.
-- `EC2RetentionStrategyTest`: reclaiming an idle spare lowers the target for its label.
+- `EC2RetentionStrategyTest`: a spare the target still wants outlives its idle timeout, and one the
+  target has given up on is reclaimed.
 - `EC2QueueMaintenanceLatencyTest`: the queue-lock paths stay fast, which is what the split between
   the executor thread and the checker thread protects.
 
