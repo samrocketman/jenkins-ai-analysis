@@ -110,6 +110,14 @@ tracked label would multiply it by the number of labels named. A spare provision
 still counts as a spare for every label it can serve, so the per-label shortfalls shrink accordingly
 and nothing is provisioned twice.
 
+*As implemented:* the floor needs no pass of its own. The label a rule **names** is itself a tracked
+label, and it is the only one charged the floor (`base = labelName.equals(config.getLabel()) ?
+config.getBaseHotSpares() : 0`, passed to a new `updateTarget` overload). Its target is therefore the
+floor, provisioned across the rule's whole group by the ordinary per-label path, and — because the
+target is what protects an agent from the idle timeout — the floor's agents are retained for the same
+reason every other spare is. A single-label rule is exactly today's behaviour, since the label it
+names and the label jobs ask for are the same entry.
+
 `maxHotSpares` becomes a ceiling **per tracked label**. This is a documented behaviour change for
 multi-label rules; single-label rules are unaffected.
 
@@ -141,16 +149,16 @@ for (Map.Entry<String, HotSpareConfigByLabel> entry : tracked.entrySet()) {
 
     int spares        = countCurrentNumberOfSpareAgentsForLabel(cloud, label);      // unchanged
     int provisioning  = countCurrentNumberOfProvisioningAgentsForLabel(cloud, label); // unchanged
-    int busy          = countAgentsRunningWorkFor(label);                            // new
+    int busy          = countAgentsRunningWorkFor(cloud, label);                     // new
     int queued        = countQueueItemsRequesting(label);                            // new
+    int base          = namedByRule ? entry.getValue().getBaseHotSpares() : 0;       // §2.2
 
     int target   = HotSpareDemand.of(cloud, label.getName())
-                       .updateTarget(entry.getValue(), spares, provisioning, queued, busy);
+                       .updateTarget(entry.getValue(), base, spares, provisioning, queued, busy);
     int toLaunch = target - (spares + provisioning);
     if (toLaunch > 0) { provisionAcrossLabelGroup(cloud, label, group, toLaunch); }
 }
-provisionRuleFloors(cloud);      // §2.2
-HotSpareDemand.forgetZeroed(cloud, tracked.keySet());   // §3.2
+HotSpareDemand.forgetZeroed(cloud, namedByRules);   // §3.2
 ```
 
 New counting helpers, both keyed on the label a job asked for rather than on what a template could
@@ -182,6 +190,7 @@ it is simply evaluated per label.
 
 `countQueueItemsForLabel` and the group-wide busy counter become unused by the checker. Keep them if
 anything else needs them; otherwise delete rather than leave two counting models in the file.
+*As implemented:* both were replaced outright by the label-attributed pair above.
 
 ### 3.2 `HotSpareDemand`
 
@@ -190,10 +199,13 @@ Already keyed `cloud.name + '\0' + label`, so the storage needs no change. Add:
 - `static Set<String> trackedLabels(EC2Cloud cloud)` — the labels with a live entry, for §2.1 case 3;
 - `static void spareConsumed(EC2Cloud cloud, String label)` — the attribution the retention strategy
   now has; the `HotSpareConfigByLabel` overload goes away;
-- `static void forgetZeroed(EC2Cloud cloud, Set<String> seenThisPass)` — drop entries that are at
-  zero and were not seen, so a controller that has run for a month does not hold an entry per label
-  ever requested. An entry above zero is never dropped, because its spares are still being kept for
-  it and it must fade rather than vanish.
+- `static void forgetZeroed(EC2Cloud cloud, Set<String> keep)` — drop entries that have faded to
+  zero, so a controller that has run for a month does not hold an entry per label ever requested. An
+  entry above zero is never dropped, because its spares are still being kept for it and it must fade
+  rather than vanish; nor is one with a spare taken since the last pass, which is a label about to
+  want something. *As implemented:* `keep` is the set of labels the rules **name** rather than the
+  labels the pass visited — a zeroed entry is visited by every pass precisely because it still
+  exists, so keying the pruning on what was visited would never prune anything.
 
 The prediction itself (`updateTarget`, growth interval, decay, ceiling) is unchanged. It becomes
 *more* accurate simply because its inputs stop describing other people's work.
