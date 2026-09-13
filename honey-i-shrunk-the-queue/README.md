@@ -10,8 +10,10 @@ for (int i = 1; i <= 100; i++) {
     parallelAgents["Agent ${agentNum}"] = { ->
         stage(agentNum) {
             node('some-label') {
-                sshagent(['some-credentials']) {
-                    sh "echo hello from ${agentNum}"
+                docker.image('alpine').inside('--init') {
+                    sshagent(['some-credentials']) {
+                        sh "echo hello from ${agentNum}"
+                    }
                 }
             }
         }
