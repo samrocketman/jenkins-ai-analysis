@@ -3,7 +3,7 @@
 When launching a Jenkinsfile with the `parallel` step with 100 build agents in
 parallel with the following flow nodes:
 
-```
+```groovy
 Map parallelAgents = [failFast: false]
 for (int i = 1; i <= 100; i++) {
     String agentNum = "Agent ${agentNum}"
