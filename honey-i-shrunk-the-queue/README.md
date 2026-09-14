@@ -18,6 +18,10 @@ environment.  I've identified the root cause across three plugins.
 [ssh-agent-plugin]:  https://github.com/jenkinsci/ssh-agent-plugin
 [github-checks-plugin]: https://github.com/jenkinsci/github-checks-plugin
 
+Related pull requests:
+
+- https://github.com/jenkinsci/docker-workflow-plugin/pull/756
+
 Example Jenkinsfile
 -------------------
 
