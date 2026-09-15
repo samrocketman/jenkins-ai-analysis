@@ -21,6 +21,7 @@ environment.  I've identified the root cause across three plugins.
 Related pull requests:
 
 - https://github.com/jenkinsci/docker-workflow-plugin/pull/756
+- https://github.com/jenkinsci/ssh-agent-plugin/pull/318
 
 Example Jenkinsfile
 -------------------
